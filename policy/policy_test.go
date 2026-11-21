@@ -1,0 +1,743 @@
+// Copyright IBM Corp. 2020, 2026
+// SPDX-License-Identifier: MPL-2.0
+
+package policy
+
+import (
+	"errors"
+	"testing"
+	"time"
+
+	multierror "github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/nomad-autoscaler/sdk"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestProcessor_ValidatePolicy(t *testing.T) {
+	testCases := []struct {
+		inputPolicy    *sdk.ScalingPolicy
+		expectedOutput error
+		name           string
+	}{
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				ID:  "ce888afe-3dd2-144c-7227-74644434f708",
+				Min: 1,
+				Max: 10,
+			},
+			expectedOutput: nil,
+			name:           "valid input policy",
+		},
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				ID:  "",
+				Min: 1,
+				Max: 10,
+			},
+			expectedOutput: &multierror.Error{
+				Errors: []error{
+					errors.New("policy ID is empty"),
+				},
+			},
+			name: "empty policy ID",
+		},
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				ID:  "ce888afe-3dd2-144c-7227-74644434f708",
+				Min: -1,
+				Max: 10,
+			},
+			expectedOutput: &multierror.Error{
+				Errors: []error{
+					errors.New("policy Min can't be negative"),
+				},
+			},
+			name: "negative minimum value",
+		},
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				ID:  "ce888afe-3dd2-144c-7227-74644434f708",
+				Min: 100,
+				Max: 10,
+			},
+			expectedOutput: &multierror.Error{
+				Errors: []error{
+					errors.New("policy Min must not be greater Max"),
+				},
+			},
+			name: "policy minimum greater than maximum",
+		},
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				ID:  "ce888afe-3dd2-144c-7227-74644434f708",
+				Min: 1,
+				Max: -10,
+			},
+			expectedOutput: &multierror.Error{
+				Errors: []error{
+					errors.New("policy Max can't be negative"),
+					errors.New("policy Min must not be greater Max"),
+				},
+			},
+			name: "negative maximum value which is lower than minimum",
+		},
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				ID:  "ce888afe-3dd2-144c-7227-74644434f708",
+				Min: 1,
+				Max: 10,
+				Target: &sdk.ScalingPolicyTarget{
+					Config: map[string]string{"datacenter": "eu-east-17"},
+				},
+			},
+			expectedOutput: nil,
+			name:           "valid datacenter horizontal cluster scaling policy",
+		},
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				ID:  "ce888afe-3dd2-144c-7227-74644434f708",
+				Min: 1,
+				Max: 10,
+				Target: &sdk.ScalingPolicyTarget{
+					Config: map[string]string{"node_class": "puppy"},
+				},
+			},
+			expectedOutput: nil,
+			name:           "valid node_class horizontal cluster scaling policy",
+		},
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				ID:  "ce888afe-3dd2-144c-7227-74644434f708",
+				Min: 1,
+				Max: 10,
+				Checks: []*sdk.ScalingPolicyCheck{
+					{
+						Name:         "instant-threshold-valid",
+						QueryInstant: true,
+						Strategy: &sdk.ScalingPolicyStrategy{
+							Name: "threshold",
+							Config: map[string]string{
+								"within_bounds_trigger": "1",
+							},
+						},
+					},
+				},
+			},
+			expectedOutput: nil,
+			name:           "valid instant threshold check",
+		},
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				ID:  "ce888afe-3dd2-144c-7227-74644434f708",
+				Min: 1,
+				Max: 10,
+				Checks: []*sdk.ScalingPolicyCheck{
+					{
+						Name:         "instant-threshold-missing-trigger",
+						QueryInstant: true,
+						Strategy: &sdk.ScalingPolicyStrategy{
+							Name:   "threshold",
+							Config: map[string]string{},
+						},
+					},
+				},
+			},
+			expectedOutput: &multierror.Error{
+				Errors: []error{
+					errors.New("check \"instant-threshold-missing-trigger\": \"within_bounds_trigger\" must be set to 1 when query_window = \"instant\""),
+				},
+			},
+			name: "invalid instant threshold check missing trigger",
+		},
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				ID:  "ce888afe-3dd2-144c-7227-74644434f708",
+				Min: 1,
+				Max: 10,
+				Checks: []*sdk.ScalingPolicyCheck{
+					{
+						Name:         "instant-threshold-invalid-trigger",
+						QueryInstant: true,
+						Strategy: &sdk.ScalingPolicyStrategy{
+							Name: "threshold",
+							Config: map[string]string{
+								"within_bounds_trigger": "5",
+							},
+						},
+					},
+				},
+			},
+			expectedOutput: &multierror.Error{
+				Errors: []error{
+					errors.New("check \"instant-threshold-invalid-trigger\": \"within_bounds_trigger\" must be set to 1 when query_window = \"instant\""),
+				},
+			},
+			name: "invalid instant threshold check trigger not one",
+		},
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				ID:  "ce888afe-3dd2-144c-7227-74644434f708",
+				Min: 1,
+				Max: 10,
+				Checks: []*sdk.ScalingPolicyCheck{
+					{
+						Name:         "instant-target-value-without-trigger",
+						QueryInstant: true,
+						Strategy: &sdk.ScalingPolicyStrategy{
+							Name:   "target-value",
+							Config: map[string]string{},
+						},
+					},
+				},
+			},
+			expectedOutput: nil,
+			name:           "valid instant non-threshold check without trigger",
+		},
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				ID:  "ce888afe-3dd2-144c-7227-74644434f708",
+				Min: 1,
+				Max: 10,
+				Checks: []*sdk.ScalingPolicyCheck{
+					{
+						Name:         "range-threshold-missing-trigger",
+						QueryInstant: false,
+						Strategy: &sdk.ScalingPolicyStrategy{
+							Name:   "threshold",
+							Config: map[string]string{},
+						},
+					},
+				},
+			},
+			expectedOutput: nil,
+			name:           "valid non-instant threshold check missing trigger",
+		},
+	}
+
+	pr := Processor{}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			actualOutput := pr.ValidatePolicy(tc.inputPolicy)
+			assert.Equal(t, tc.expectedOutput, actualOutput, tc.name)
+		})
+	}
+}
+
+func TestProcessor_ValidatePolicy_QueryFormat(t *testing.T) {
+	testCases := []struct {
+		inputPolicy    *sdk.ScalingPolicy
+		expectedOutput error
+		name           string
+	}{
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				ID:  "ce888afe-3dd2-144c-7227-74644434f708",
+				Min: 1,
+				Max: 10,
+				Target: &sdk.ScalingPolicyTarget{
+					Config: map[string]string{"node_class": "hashistack"},
+				},
+				Checks: []*sdk.ScalingPolicyCheck{
+					{
+						Name:   "mem",
+						Source: "nomad-apm",
+						Query:  "percentage-allocated_memory",
+					},
+				},
+			},
+			expectedOutput: nil,
+			name:           "valid short query for node pool target passes",
+		},
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				ID:  "ce888afe-3dd2-144c-7227-74644434f708",
+				Min: 1,
+				Max: 10,
+				Target: &sdk.ScalingPolicyTarget{
+					Config: map[string]string{"node_class": "hashistack"},
+				},
+				Checks: []*sdk.ScalingPolicyCheck{
+					{
+						Name:   "mem",
+						Source: "nomad-apm",
+						Query:  "node_percentage-allocated_memory/hashistack/class",
+					},
+				},
+			},
+			expectedOutput: &multierror.Error{
+				Errors: []error{
+					errors.New("check \"mem\": query must be in short format (<operation>_<metric>) for Nomad APM node pool targets"),
+				},
+			},
+			name: "legacy long-form query rejected for node pool target",
+		},
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				ID:  "ce888afe-3dd2-144c-7227-74644434f708",
+				Min: 1,
+				Max: 10,
+				Target: &sdk.ScalingPolicyTarget{
+					Config: map[string]string{"node_class": "hashistack"},
+				},
+				Checks: []*sdk.ScalingPolicyCheck{
+					{
+						Name:   "mem",
+						Source: "nomad-apm",
+						Query:  "node_percentage-allocated_memory/node_class=hashistack",
+					},
+				},
+			},
+			expectedOutput: &multierror.Error{
+				Errors: []error{
+					errors.New("check \"mem\": query must be in short format (<operation>_<metric>) for Nomad APM node pool targets"),
+				},
+			},
+			name: "full internal-form query rejected for node pool target",
+		},
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				ID:  "ce888afe-3dd2-144c-7227-74644434f708",
+				Min: 1,
+				Max: 10,
+				Target: &sdk.ScalingPolicyTarget{
+					Config: map[string]string{"node_class": "hashistack"},
+				},
+				Checks: []*sdk.ScalingPolicyCheck{
+					{
+						Name:  "mem",
+						Query: "node_percentage-allocated_memory/hashistack/class",
+					},
+				},
+			},
+			expectedOutput: &multierror.Error{
+				Errors: []error{
+					errors.New("check \"mem\": query must be in short format (<operation>_<metric>) for Nomad APM node pool targets"),
+				},
+			},
+			name: "empty source defaults to nomad-apm and rejects long-form",
+		},
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				ID:  "ce888afe-3dd2-144c-7227-74644434f708",
+				Min: 1,
+				Max: 10,
+				Target: &sdk.ScalingPolicyTarget{
+					Config: map[string]string{"node_class": "hashistack"},
+				},
+				Checks: []*sdk.ScalingPolicyCheck{
+					{
+						Name:   "mem",
+						Source: "prometheus",
+						Query:  "node_percentage-allocated_memory/hashistack/class",
+					},
+				},
+			},
+			expectedOutput: nil,
+			name:           "non-nomad-apm source skips query format validation",
+		},
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				ID:  "ce888afe-3dd2-144c-7227-74644434f708",
+				Min: 1,
+				Max: 10,
+				Target: &sdk.ScalingPolicyTarget{
+					Config: map[string]string{
+						"Job":       "example",
+						"Group":     "cache",
+						"Namespace": "default",
+					},
+				},
+				Checks: []*sdk.ScalingPolicyCheck{
+					{
+						Name:   "mem",
+						Source: "nomad-apm",
+						Query:  "node_percentage-allocated_memory/hashistack/class",
+					},
+				},
+			},
+			expectedOutput: nil,
+			name:           "non-node-pool target skips query format validation",
+		},
+	}
+
+	pr := Processor{nomadAPMs: []string{"nomad-apm"}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			actualOutput := pr.ValidatePolicy(tc.inputPolicy)
+			assert.Equal(t, tc.expectedOutput, actualOutput, tc.name)
+		})
+	}
+}
+
+func TestProcessor_CanonicalizeAPMQuery(t *testing.T) {
+	testCases := []struct {
+		inputCheck          *sdk.ScalingPolicyCheck
+		inputAPMNames       []string
+		inputTarget         *sdk.ScalingPolicyTarget
+		expectedOutputCheck *sdk.ScalingPolicyCheck
+		name                string
+	}{
+		{
+			inputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "prometheus",
+				Query:  "scalar(super-data-point)",
+			},
+			inputAPMNames: []string{"nomad-apm"},
+			inputTarget:   nil,
+			expectedOutputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "prometheus",
+				Query:  "scalar(super-data-point)",
+			},
+			name: "fully populated query",
+		},
+		{
+			inputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "nomad-apm",
+				Query:  "node_percentage-allocated_memory/hashistack/class",
+			},
+			inputAPMNames: []string{"nomad-apm"},
+			inputTarget:   nil,
+			expectedOutputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "nomad-apm",
+				Query:  "node_percentage-allocated_memory/hashistack/class",
+			},
+			name: "fully populated non-short node query",
+		},
+		{
+			inputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "nomad-apm",
+				Query:  "taskgroup_avg_cpu/cache/example",
+			},
+			inputAPMNames: []string{"nomad-apm"},
+			inputTarget:   nil,
+			expectedOutputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "nomad-apm",
+				Query:  "taskgroup_avg_cpu/cache/example",
+			},
+			name: "fully populated non-short taskgroup query",
+		},
+		{
+			inputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "nomad-apm",
+				Query:  "avg_cpu",
+			},
+			inputAPMNames: []string{"nomad-apm"},
+			inputTarget: &sdk.ScalingPolicyTarget{
+				Config: map[string]string{
+					"Namespace": "dev",
+					"Job":       "example",
+					"Group":     "cache",
+				},
+			},
+			expectedOutputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "nomad-apm",
+				Query:  "taskgroup_avg_cpu/cache/example@dev",
+			},
+			name: "correctly formatted taskgroup target short query",
+		},
+		{
+			inputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "nomad-apm",
+				Query:  "percentage-allocated_memory",
+			},
+			inputAPMNames: []string{"nomad-apm"},
+			inputTarget: &sdk.ScalingPolicyTarget{
+				Config: map[string]string{"node_class": "hashistack"},
+			},
+			expectedOutputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "nomad-apm",
+				Query:  "node_percentage-allocated_memory/node_class=hashistack",
+			},
+			name: "node target short query with node_class",
+		},
+		{
+			inputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "nomad-apm",
+				Query:  "percentage-allocated_cpu",
+			},
+			inputAPMNames: []string{"nomad-apm"},
+			inputTarget: &sdk.ScalingPolicyTarget{
+				Config: map[string]string{"datacenter": "us-east-1"},
+			},
+			expectedOutputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "nomad-apm",
+				Query:  "node_percentage-allocated_cpu/datacenter=us-east-1",
+			},
+			name: "node target short query with datacenter",
+		},
+		{
+			inputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "nomad-apm",
+				Query:  "percentage-allocated_cpu",
+			},
+			inputAPMNames: []string{"nomad-apm"},
+			inputTarget: &sdk.ScalingPolicyTarget{
+				Config: map[string]string{"node_pool": "gpu"},
+			},
+			expectedOutputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "nomad-apm",
+				Query:  "node_percentage-allocated_cpu/node_pool=gpu",
+			},
+			name: "node target short query with node_pool",
+		},
+		{
+			inputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "nomad-apm",
+				Query:  "percentage-allocated_memory",
+			},
+			inputAPMNames: []string{"nomad-apm"},
+			inputTarget: &sdk.ScalingPolicyTarget{
+				Config: map[string]string{"node_class": "hashistack", "datacenter": "dc1"},
+			},
+			expectedOutputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "nomad-apm",
+				Query:  "node_percentage-allocated_memory/node_class=hashistack,datacenter=dc1",
+			},
+			name: "node target short query with node_class and datacenter combined",
+		},
+		{
+			inputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "nomad-apm",
+				Query:  "percentage-allocated_cpu",
+			},
+			inputAPMNames: []string{"nomad-apm"},
+			inputTarget: &sdk.ScalingPolicyTarget{
+				Config: map[string]string{"datacenter": "us east 1"},
+			},
+			expectedOutputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "nomad-apm",
+				Query:  "node_percentage-allocated_cpu/datacenter=us+east+1",
+			},
+			name: "node target short query with space in value",
+		},
+		{
+			inputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "nomad-apm",
+				Query:  "avg_cpu",
+			},
+			inputAPMNames: []string{"nomad-apm"},
+			inputTarget: &sdk.ScalingPolicyTarget{
+				Config: map[string]string{"Job": "example"},
+			},
+			expectedOutputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "nomad-apm",
+				Query:  "avg_cpu",
+			},
+			name: "incorrectly formatted taskgroup target short query",
+		},
+		{
+			inputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "nomad-apm",
+				Query:  "percentage-allocated_memory",
+			},
+			inputAPMNames: []string{"nomad-apm"},
+			inputTarget: &sdk.ScalingPolicyTarget{
+				Config: map[string]string{},
+			},
+			expectedOutputCheck: &sdk.ScalingPolicyCheck{
+				Name:   "random-check",
+				Source: "nomad-apm",
+				Query:  "percentage-allocated_memory",
+			},
+			name: "incorrectly formatted node target short query",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			pr := Processor{nomadAPMs: tc.inputAPMNames}
+			pr.CanonicalizeAPMQuery(tc.inputCheck, tc.inputTarget)
+			assert.Equal(t, tc.expectedOutputCheck, tc.inputCheck, tc.name)
+		})
+	}
+}
+
+func TestProcessor_ApplyPolicyDefaults(t *testing.T) {
+	testCases := []struct {
+		inputPolicy          *sdk.ScalingPolicy
+		inputDefaults        *ConfigDefaults
+		expectedOutputPolicy *sdk.ScalingPolicy
+		name                 string
+	}{
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				Cooldown: 20 * time.Second,
+			},
+			inputDefaults: &ConfigDefaults{
+				DefaultEvaluationInterval: 5 * time.Second,
+				DefaultCooldown:           10 * time.Second,
+			},
+			expectedOutputPolicy: &sdk.ScalingPolicy{
+				Cooldown:           20 * time.Second,
+				CooldownOnScaleUp:  20 * time.Second,
+				EvaluationInterval: 5 * time.Second,
+			},
+			name: "evaluation interval set to default",
+		},
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				EvaluationInterval: 15 * time.Second,
+			},
+			inputDefaults: &ConfigDefaults{
+				DefaultEvaluationInterval: 5 * time.Second,
+				DefaultCooldown:           11 * time.Second,
+			},
+			expectedOutputPolicy: &sdk.ScalingPolicy{
+				Cooldown:           11 * time.Second,
+				CooldownOnScaleUp:  11 * time.Second,
+				EvaluationInterval: 15 * time.Second,
+			},
+			name: "cooldown set to default",
+		},
+		{
+			inputPolicy: &sdk.ScalingPolicy{},
+			inputDefaults: &ConfigDefaults{
+				DefaultEvaluationInterval: 5 * time.Second,
+				DefaultCooldown:           10 * time.Second,
+			},
+			expectedOutputPolicy: &sdk.ScalingPolicy{
+				Cooldown:           10 * time.Second,
+				CooldownOnScaleUp:  10 * time.Second,
+				EvaluationInterval: 5 * time.Second,
+			},
+			name: "evaluation interval and cooldown set to default",
+		},
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				Cooldown:           10 * time.Minute,
+				EvaluationInterval: 5 * time.Minute,
+			},
+			inputDefaults: &ConfigDefaults{
+				DefaultEvaluationInterval: 5 * time.Second,
+				DefaultCooldown:           10 * time.Second,
+			},
+			expectedOutputPolicy: &sdk.ScalingPolicy{
+				Cooldown:           10 * time.Minute,
+				CooldownOnScaleUp:  10 * time.Minute,
+				EvaluationInterval: 5 * time.Minute,
+			},
+			name: "neither set to default",
+		},
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				CooldownOnScaleUp:  10 * time.Minute,
+				EvaluationInterval: 5 * time.Minute,
+			},
+			inputDefaults: &ConfigDefaults{
+				DefaultEvaluationInterval: 5 * time.Second,
+				DefaultCooldown:           5 * time.Second,
+			},
+			expectedOutputPolicy: &sdk.ScalingPolicy{
+				Cooldown:           5 * time.Second,
+				CooldownOnScaleUp:  10 * time.Minute,
+				EvaluationInterval: 5 * time.Minute,
+			},
+			name: "cooldown not set",
+		},
+		{
+			inputPolicy: &sdk.ScalingPolicy{
+				Cooldown:           5 * time.Second,
+				CooldownOnScaleUp:  10 * time.Minute,
+				EvaluationInterval: 5 * time.Minute,
+			},
+			inputDefaults: &ConfigDefaults{
+				DefaultEvaluationInterval: 5 * time.Second,
+				DefaultCooldown:           15 * time.Second,
+			},
+			expectedOutputPolicy: &sdk.ScalingPolicy{
+				Cooldown:           5 * time.Second,
+				CooldownOnScaleUp:  10 * time.Minute,
+				EvaluationInterval: 5 * time.Minute,
+			},
+			name: "cooldown and cool_down_scale_up set",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			pr := Processor{defaults: tc.inputDefaults}
+			pr.ApplyPolicyDefaults(tc.inputPolicy)
+			assert.Equal(t, tc.expectedOutputPolicy, tc.inputPolicy, tc.name)
+		})
+	}
+}
+
+func TestProcessor_isNomadAPMQuery(t *testing.T) {
+	testCases := []struct {
+		inputProcessor *Processor
+		inputSource    string
+		expectedOutput bool
+		name           string
+	}{
+		{
+			inputProcessor: &Processor{
+				nomadAPMs: nil,
+			},
+			inputSource:    "nagios",
+			expectedOutput: false,
+			name:           "no nomad APMs configured",
+		},
+		{
+			inputProcessor: &Processor{
+				nomadAPMs: []string{"nomad-apm"},
+			},
+			inputSource:    "nagios",
+			expectedOutput: false,
+			name:           "source doesn't match Nomad APM name",
+		},
+		{
+			inputProcessor: &Processor{
+				nomadAPMs: []string{"nomad-apm"},
+			},
+			inputSource:    "nomad-apm",
+			expectedOutput: true,
+			name:           "source does match default Nomad APM name",
+		},
+		{
+			inputProcessor: &Processor{
+				nomadAPMs: []string{"nomad-platform-apm"},
+			},
+			inputSource:    "nomad-platform-apm",
+			expectedOutput: true,
+			name:           "source does match non-default Nomad APM name",
+		},
+		{
+			inputProcessor: &Processor{
+				nomadAPMs: []string{"nomad-qa-apm", "nomad-platform-apm", "nomad-support-apm"},
+			},
+			inputSource:    "nomad-platform-apm",
+			expectedOutput: true,
+			name:           "source does match non-default Nomad APM name in list of APM name",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			actualOutput := tc.inputProcessor.isNomadAPMQuery(tc.inputSource)
+			assert.Equal(t, tc.expectedOutput, actualOutput, tc.name)
+		})
+	}
+}

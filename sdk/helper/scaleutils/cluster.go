@@ -1,0 +1,436 @@
+// Copyright IBM Corp. 2020, 2026
+// SPDX-License-Identifier: MPL-2.0
+
+package scaleutils
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strconv"
+
+	hclog "github.com/hashicorp/go-hclog"
+	multierror "github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/nomad-autoscaler/sdk"
+	errHelper "github.com/hashicorp/nomad-autoscaler/sdk/helper/error"
+	"github.com/hashicorp/nomad-autoscaler/sdk/helper/scaleutils/nodepool"
+	"github.com/hashicorp/nomad-autoscaler/sdk/helper/scaleutils/nodeselector"
+	"github.com/hashicorp/nomad/api"
+)
+
+// We use the node drainer interface in order to separate the nomad-autoscaler
+// node drain logic from the actual drain execution, which is executed using the
+// nomad API, allowing us to better define the boundary and write better tests.
+type nodeDrainer interface {
+	UpdateDrainOpts(nodeID string, opts *api.DrainOptions, q *api.WriteOptions) (*api.NodeDrainUpdateResponse, error)
+	MonitorDrain(ctx context.Context, nodeID string, index uint64, ignoreSys bool) <-chan *api.MonitorMessage
+}
+
+var errInvalidScaleInNum = errors.New("number of nodes requested for removal must be greater than zero")
+
+// ClusterScaleUtils provides common functionality when performing horizontal
+// cluster scaling evaluations and actions.
+type ClusterScaleUtils struct {
+	log    hclog.Logger
+	client *api.Client
+
+	// curNodeID is the ID of the node that the Nomad Autoscaler is currently
+	// running on.
+	//
+	// TODO(jrasell) this should be removed once the cluster targets and core
+	//  autoscaler components are updated to handle reconciliation.
+	curNodeID string
+
+	// ClusterNodeIDLookupFunc is the callback function used to translate a
+	// Nomad nodes ID to the remote resource ID used by the target platform.
+	ClusterNodeIDLookupFunc ClusterNodeIDLookupFunc
+
+	drainer nodeDrainer
+}
+
+// NewClusterScaleUtils instantiates a new ClusterScaleUtils object for use.
+func NewClusterScaleUtils(cfg *api.Config, log hclog.Logger) (*ClusterScaleUtils, error) {
+
+	client, err := api.NewClient(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to instantiate Nomad client: %v", err)
+	}
+
+	// Identifying the node is best-effort and should not result in a terminal
+	// error when setting up the utils.
+	id, err := autoscalerNodeID(client)
+	if err != nil {
+		log.Error("failed to identify Nomad Autoscaler nodeID", "error", err)
+	}
+
+	return &ClusterScaleUtils{
+		log:       log,
+		client:    client,
+		curNodeID: id,
+		drainer:   client.Nodes(),
+	}, nil
+}
+
+// RunPreScaleInTasks triggers all the tasks, including node identification and
+// draining, required before terminating the nodes in the remote provider.
+// COMPAT(0.4)
+func (c *ClusterScaleUtils) RunPreScaleInTasks(ctx context.Context, cfg map[string]string, num int) ([]NodeResourceID, error) {
+
+	// Check that the ClusterNodeIDLookupFunc has been set, otherwise we cannot
+	// attempt to identify nodes and their remote resource IDs.
+	if c.ClusterNodeIDLookupFunc == nil {
+		return nil, errors.New("required ClusterNodeIDLookupFunc not set")
+	}
+
+	nodes, err := c.IdentifyScaleInNodes(cfg, num)
+	if err != nil {
+		return nil, err
+	}
+
+	// Technically we do not need this information until after the nodes have
+	// been drained. However, this doesn't change cluster state and so do this
+	// first to make sure there are no issues in translating.
+	nodeResourceIDs, err := c.IdentifyScaleInRemoteIDs(nodes)
+	if err != nil {
+		return nil, err
+	}
+
+	// Drain the nodes.
+	// TODO(jrasell) we should try some reconciliation here, where we identify
+	//  failed nodes and continue with nodes that drained successfully.
+	if err := c.DrainNodes(ctx, cfg, nodeResourceIDs); err != nil {
+		return nil, err
+	}
+	c.log.Debug("pre scale-in tasks now complete")
+
+	return nodeResourceIDs, nil
+}
+
+// RunPreScaleInTasksWithRemoteCheck triggers all the tasks, including node
+// identification, filtering by remote ID, and draining, required before
+// terminating the nodes in the remote provider.
+func (c *ClusterScaleUtils) RunPreScaleInTasksWithRemoteCheck(ctx context.Context, cfg map[string]string, remoteIDs []string, num int) ([]NodeResourceID, error) {
+
+	// Check that the ClusterNodeIDLookupFunc has been set, otherwise we cannot
+	// attempt to identify nodes and their remote resource IDs.
+	if c.ClusterNodeIDLookupFunc == nil {
+		return nil, errors.New("required ClusterNodeIDLookupFunc not set")
+	}
+
+	if num < 1 {
+		return nil, errInvalidScaleInNum
+	}
+
+	// Find nodes in Nomad that match the node filtering criteria.
+	nodes, err := c.identifyEligibleScaleInNodes(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	// Find the remote ID for each of the Nomad nodes found.
+	nodeResourceIDs, err := c.IdentifyScaleInRemoteIDs(nodes)
+	if err != nil {
+		return nil, err
+	}
+
+	// Index nodes and remote node IDs by Nomad node ID for easier access.
+	nodesMap := make(map[string]*api.NodeListStub)
+	for _, n := range nodes {
+		nodesMap[n.ID] = n
+	}
+	nodesResourceIDsMap := make(map[string]NodeResourceID)
+	for _, id := range nodeResourceIDs {
+		nodesResourceIDsMap[id.NomadNodeID] = id
+	}
+
+	// Filter out nodes that are not part of the remote ID list.
+	filteredNodes := []*api.NodeListStub{}
+	for _, id := range nodeResourceIDs {
+		for _, remoteID := range remoteIDs {
+			if id.RemoteResourceID == remoteID {
+				c.log.Debug("node is part of the policy target", "node_id", id.NomadNodeID, "remote_id", id.RemoteResourceID)
+				filteredNodes = append(filteredNodes, nodesMap[id.NomadNodeID])
+				break
+			}
+		}
+	}
+
+	// Ensure we have not filtered out all the available nodes.
+	if len(filteredNodes) == 0 {
+		return nil, fmt.Errorf("no nodes identified for scaling in action")
+	}
+
+	// If the caller has requested more nodes than we have available once
+	// filtered, adjust the value. This shouldn't cause the whole scaling
+	// action to fail, but we should warn.
+	if num > len(filteredNodes) {
+		c.log.Warn("can only identify portion of requested nodes for removal",
+			"requested", num, "available", len(filteredNodes))
+		num = len(filteredNodes)
+	}
+
+	// Select which nodes to drain and terminate based on the policy's
+	// node selector strategy.
+	selectedNodes, err := c.SelectScaleInNodes(filteredNodes, cfg, num)
+	if err != nil {
+		return nil, err
+	}
+
+	selectedResourceIDs := []NodeResourceID{}
+	for _, n := range selectedNodes {
+		c.log.Debug("node selected for removal", "node_id", n.ID, "remote_id", nodesResourceIDsMap[n.ID].RemoteResourceID)
+		selectedResourceIDs = append(selectedResourceIDs, nodesResourceIDsMap[n.ID])
+	}
+
+	// Drain the nodes.
+	// TODO(jrasell) we should try some reconciliation here, where we identify
+	//  failed nodes and continue with nodes that drained successfully.
+	if err := c.DrainNodes(ctx, cfg, selectedResourceIDs); err != nil {
+		return nil, err
+	}
+	c.log.Debug("pre scale-in tasks now complete")
+
+	return selectedResourceIDs, nil
+}
+
+func (c *ClusterScaleUtils) IdentifyScaleInNodes(cfg map[string]string, num int) ([]*api.NodeListStub, error) {
+
+	if num < 1 {
+		return nil, errInvalidScaleInNum
+	}
+
+	filteredNodes, err := c.identifyEligibleScaleInNodes(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	// If the caller has requested more nodes than we have available once
+	// filtered, adjust the value. This shouldn't cause the whole scaling
+	// action to fail, but we should warn.
+	if num > len(filteredNodes) {
+		c.log.Warn("can only identify portion of requested nodes for removal",
+			"requested", num, "available", len(filteredNodes))
+		num = len(filteredNodes)
+	}
+
+	selectedNodes, err := c.SelectScaleInNodes(filteredNodes, cfg, num)
+	if err != nil {
+		return nil, err
+	}
+
+	return selectedNodes, nil
+}
+
+func (c *ClusterScaleUtils) identifyEligibleScaleInNodes(cfg map[string]string) ([]*api.NodeListStub, error) {
+
+	ids, err := nodepool.NewClusterNodePoolIdentifierList(cfg)
+	if err != nil {
+		return nil, err
+	}
+	c.log.Debug("performing node pool filtering", "identifiers", ids.String())
+
+	// Pull a current list of Nomad nodes from the API including populated
+	// resource fields.
+	nodes, _, err := c.client.Nodes().List(&api.QueryOptions{Params: map[string]string{"resources": "true"}})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list Nomad nodes from API: %v", err)
+	}
+
+	if c.log.IsDebug() {
+		for _, n := range nodes {
+			c.log.Debug("found node",
+				"node_id", n.ID, "datacenter", n.Datacenter, "node_class", n.NodeClass, "node_pool", n.NodePool,
+				"status", n.Status, "eligibility", n.SchedulingEligibility, "draining", n.Drain,
+			)
+		}
+	}
+
+	// For scale-in, ineligible nodes are valid termination candidates and
+	// should not be excluded from the pool. Default to including them unless
+	// the caller has explicitly configured otherwise.
+	if _, ok := cfg[XNodeFilterOptionIgnoreIneligible]; !ok {
+		cfg[XNodeFilterOptionIgnoreIneligible] = "true"
+	}
+
+	// Filter our nodes to select only those within our identified pool.
+	filterOpts, err := NewNodeFilterOptions(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	filteredNodes, err := FilterNodesWithOptions(nodes, ids.IsPoolMember, filterOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	// Filter out the Nomad node ID where this autoscaler instance is running.
+	filteredNodes = filterOutNodeID(filteredNodes, c.curNodeID)
+
+	if c.log.IsDebug() {
+		for _, n := range filteredNodes {
+			c.log.Debug("node passed filter criteria", "node_id", n.ID)
+		}
+	}
+
+	// Ensure we have not filtered out all the available nodes.
+	if len(filteredNodes) == 0 {
+		return nil, fmt.Errorf("no nodes unfiltered for pool identifiers: %v", ids)
+	}
+
+	return filteredNodes, nil
+}
+
+func (c *ClusterScaleUtils) IdentifyScaleInRemoteIDs(nodes []*api.NodeListStub) ([]NodeResourceID, error) {
+
+	var (
+		out  []NodeResourceID
+		mErr *multierror.Error
+	)
+
+	for _, node := range nodes {
+
+		// Read the full node object from the API which will contain the full
+		// information required to identify the remote provider ID. If we get a
+		// single error here, it's likely we won't be able to perform any of the
+		// API calls, therefore just exit rather than collect all the errors.
+		nodeInfo, _, err := c.client.Nodes().Info(node.ID, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		// Use the identification function to attempt to pull the remote
+		// provider ID information from the Node info.
+		id, err := c.ClusterNodeIDLookupFunc(nodeInfo)
+		if err != nil {
+			mErr = multierror.Append(mErr, err)
+			continue
+		}
+
+		// Add a nice log message for the operators so they can see the node
+		// that has been identified if they wish.
+		c.log.Debug("identified remote provider ID for node", "node_id", nodeInfo.ID, "remote_id", id)
+		out = append(out, NodeResourceID{NomadNodeID: node.ID, RemoteResourceID: id})
+	}
+
+	if mErr != nil {
+		return nil, errHelper.FormattedMultiError(mErr)
+	}
+	return out, nil
+}
+
+func (c *ClusterScaleUtils) SelectScaleInNodes(nodes []*api.NodeListStub, cfg map[string]string, num int) ([]*api.NodeListStub, error) {
+	// Setup the node selector used to identify suitable nodes for termination.
+	selector, err := nodeselector.NewSelector(cfg, c.client, c.log)
+	if err != nil {
+		return nil, err
+	}
+	c.log.Debug("performing node selection", "selector_strategy", selector.Name())
+
+	// It is possible the selector is unable to identify suitable nodes and so
+	// we should return an error to stop additional execution.
+	out := selector.Select(nodes, num)
+	if len(out) < 1 {
+		return nil, fmt.Errorf("no nodes selected using strategy %s", selector.Name())
+	}
+
+	// Selection can filter most of the nodes in the filtered list, we should
+	// log about this, but using certain strategies this is to be expected.
+	if len(out) < num {
+		c.log.Info("identified portion of requested nodes for removal",
+			"requested", num, "identified", len(out))
+	}
+	return out, nil
+}
+
+// RunPostScaleInTasks triggers any tasks which should occur after the nodes
+// have been terminated within the remote provider.
+//
+// The context is currently ignored on purpose, pending investigation into
+// plugging this into the Nomad API query meta.
+func (c *ClusterScaleUtils) RunPostScaleInTasks(_ context.Context, cfg map[string]string, ids []NodeResourceID) error {
+
+	// Attempt to read of the node purge config parameter. If it has been set
+	// then check its value, otherwise the default stance is that node purging
+	// is disabled.
+	if val, ok := cfg[sdk.TargetConfigKeyNodePurge]; ok {
+
+		// Parse the string as a bool. If we get an error return this as the
+		// operator has attempted to configure this value, but it's not worth
+		// breaking the whole pipeline for. Therefore log the error and return
+		// as Nomad will eventually perform this work.
+		boolVal, err := strconv.ParseBool(val)
+		if err != nil {
+			c.log.Error("failed to parse node_purge config param", "error", err)
+			return nil
+		}
+
+		// If the operator has disabled node purging, exit.
+		if !boolVal {
+			return nil
+		}
+	} else {
+		return nil
+	}
+
+	// Use a multierror to collect errors from any and all node purge calls
+	// that fail.
+	var mErr *multierror.Error
+
+	// Iterate the node list and perform a purge on each node. In the event of
+	// an error, add this to the list. Otherwise log useful information.
+	for _, node := range ids {
+
+		resp, _, err := c.client.Nodes().Purge(node.NomadNodeID, nil)
+		if err != nil {
+			mErr = multierror.Append(mErr, err)
+		} else {
+			c.log.Info("successfully purged Nomad node", "node_id", node.NomadNodeID, "nomad_evals", resp.EvalIDs)
+		}
+	}
+
+	return errHelper.FormattedMultiError(mErr)
+}
+
+// IsPoolReady provides a method for understanding whether the node pool is in
+// a state that allows it to be safely scaled. This should be used by target
+// plugins when providing their status response. A non-nil error indicates
+// there was a problem performing the check.
+func (c *ClusterScaleUtils) IsPoolReady(cfg map[string]string) (bool, error) {
+
+	ids, err := nodepool.NewClusterNodePoolIdentifierList(cfg)
+	if err != nil {
+		return false, err
+	}
+
+	nodes, _, err := c.client.Nodes().List(nil)
+	if err != nil {
+		return false, fmt.Errorf("failed to list Nomad nodes: %v", err)
+	}
+
+	filterOpts, err := NewNodeFilterOptions(cfg)
+	if err != nil {
+		return false, err
+	}
+	if _, err := FilterNodesWithOptions(nodes, ids.IsPoolMember, filterOpts); err != nil {
+		c.log.Warn("node pool status readiness check failed", "error", err)
+		return false, nil
+	}
+	return true, nil
+}
+
+// autoscalerNodeID identifies the NodeID which the Nomad Autoscaler is running
+// on so that it can be protected from scaling in actions.
+func autoscalerNodeID(client *api.Client) (string, error) {
+
+	envVar := os.Getenv("NOMAD_ALLOC_ID")
+	if envVar == "" {
+		return "", nil
+	}
+
+	allocInfo, _, err := client.Allocations().Info(envVar, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to call Nomad allocation info: %v", err)
+	}
+	return allocInfo.NodeID, nil
+}

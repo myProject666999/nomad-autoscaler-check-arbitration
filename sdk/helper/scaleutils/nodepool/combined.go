@@ -1,0 +1,35 @@
+// Copyright IBM Corp. 2020, 2026
+// SPDX-License-Identifier: MPL-2.0
+
+package nodepool
+
+import (
+	"strings"
+
+	"github.com/hashicorp/nomad/api"
+)
+
+// ClusterNodePoolIdentifierList is a list of ClusterNodePoolIdentifier
+// values that filters nodes using AND logic. A node must match every
+// identifier in the list to be considered a pool member.
+type ClusterNodePoolIdentifierList []ClusterNodePoolIdentifier
+
+// IsPoolMember returns true if the node matches all identifiers in the list.
+func (l ClusterNodePoolIdentifierList) IsPoolMember(n *api.NodeListStub) bool {
+	for _, id := range l {
+		if !id.IsPoolMember(n) {
+			return false
+		}
+	}
+	return true
+}
+
+// String implements fmt.Stringer so that formatted printing produces a
+// human-readable representation instead of pointer addresses.
+func (l ClusterNodePoolIdentifierList) String() string {
+	parts := make([]string, len(l))
+	for i, id := range l {
+		parts[i] = id.Key() + "=" + id.Value()
+	}
+	return strings.Join(parts, ", ")
+}
