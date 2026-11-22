@@ -94,7 +94,7 @@ func TestCheckHandler_getNewCountFromMetrics(t *testing.T) {
 			runErr:         errTest,
 			policy:         testPolicy,
 			metrics:        sdk.TimestampedMetrics{},
-			expError:       nil,
+			expError:       errCheckIgnoredByOnError,
 			expectedAction: sdk.ScalingAction{},
 		},
 		{
@@ -103,7 +103,7 @@ func TestCheckHandler_getNewCountFromMetrics(t *testing.T) {
 			runErr:         errTest,
 			policy:         testPolicyOnErrorIgnore,
 			metrics:        sdk.TimestampedMetrics{},
-			expError:       nil,
+			expError:       errCheckIgnoredByOnError,
 			expectedAction: sdk.ScalingAction{},
 		},
 		{
@@ -112,7 +112,7 @@ func TestCheckHandler_getNewCountFromMetrics(t *testing.T) {
 			runErr:         errTest,
 			policy:         testPolicy,
 			metrics:        sdk.TimestampedMetrics{},
-			expError:       nil,
+			expError:       errCheckIgnoredByOnError,
 			expectedAction: sdk.ScalingAction{},
 		},
 		{
@@ -130,7 +130,7 @@ func TestCheckHandler_getNewCountFromMetrics(t *testing.T) {
 			runErr:         errTest,
 			policy:         testPolicy,
 			metrics:        sdk.TimestampedMetrics{},
-			expError:       nil,
+			expError:       errCheckIgnoredByOnError,
 			expectedAction: sdk.ScalingAction{},
 		},
 		{
@@ -188,7 +188,8 @@ func TestCheckHandler_getNewCountFromMetrics(t *testing.T) {
 
 			action, err := runner.getNewCountFromStrategy(context.Background(), 3, tt.metrics)
 			must.Eq(t, tt.expectedAction, action)
-			must.Eq(t, tt.expError, errors.Unwrap(err))
+			must.True(t, errors.Is(err, tt.expError),
+				must.Sprintf("expected error %v, got %v", tt.expError, err))
 
 		})
 	}
@@ -411,18 +412,13 @@ func TestCheckHandler_runCheckAndCapCount_IgnoredStrategyErrorsContinueEvaluatio
 	})
 
 	action, err := runner.runCheckAndCapCount(context.Background(), 5, newQueryMetricsCache())
-	must.NoError(t, err)
-	must.Eq(t, sdk.ScaleDirectionNone, action.Direction)
 
-	// Side-effect sanity check: count is capped into policy bounds when the
-	// ignored strategy error returns an empty action.
-	must.Eq(t, testPolicy.Min, action.Count)
-	capped, ok := action.Meta["nomad_autoscaler.count.capped"].(bool)
-	must.True(t, ok)
-	must.True(t, capped)
-	original, ok := action.Meta["nomad_autoscaler.count.original"].(int64)
-	must.True(t, ok)
-	must.Eq(t, int64(0), original)
+	// The ignored strategy error surfaces as a sentinel so the handler skips
+	// this check during arbitration instead of treating its empty action as a
+	// `none` vote; evaluation of the remaining checks continues.
+	must.True(t, errors.Is(err, errCheckIgnoredByOnError),
+		must.Sprintf("expected errCheckIgnoredByOnError, got %v", err))
+	must.Eq(t, sdk.ScalingAction{}, action)
 	must.Eq(t, 1, ml.queryCalls)
 	must.Eq(t, 1, sr.runCalls)
 }

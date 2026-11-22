@@ -32,6 +32,7 @@ type stubChecker struct {
 	action    sdk.ScalingAction
 	err       error
 	groupName string
+	checkName string
 	calls     int
 }
 
@@ -42,6 +43,10 @@ func (s *stubChecker) runCheckAndCapCount(_ context.Context, _ int64, _ *queryMe
 
 func (s *stubChecker) group() string {
 	return s.groupName
+}
+
+func (s *stubChecker) name() string {
+	return s.checkName
 }
 
 func (m *MockLimiter) getReleaseCalled() bool {
@@ -176,145 +181,6 @@ func TestHandler_WaitAndScale(t *testing.T) {
 	}
 }
 
-func Test_pickWinnerActionFromGroups(t *testing.T) {
-
-	actionNone := &sdk.ScalingAction{
-		Direction: sdk.ScaleDirectionNone,
-		Count:     0,
-	}
-	actionUp := &sdk.ScalingAction{
-		Direction: sdk.ScaleDirectionUp,
-		Count:     5,
-	}
-	actionDown := &sdk.ScalingAction{
-		Direction: sdk.ScaleDirectionDown,
-		Count:     1,
-	}
-
-	runnerA := &checkRunner{
-		check: &sdk.ScalingPolicyCheck{Name: "A"},
-	}
-	runnerB := &checkRunner{
-		check: &sdk.ScalingPolicyCheck{Name: "B"},
-	}
-	runnerC := &checkRunner{
-		check: &sdk.ScalingPolicyCheck{Name: "C"},
-	}
-
-	tests := []struct {
-		name        string
-		checkGroups map[string][]checkResult
-		wantAction  *sdk.ScalingAction
-		wantHandler *checkRunner
-	}{
-		{
-			name: "all_none_in_group",
-			checkGroups: map[string][]checkResult{
-				"group1": {
-					{action: actionNone, handler: runnerA, group: "group1"},
-					{action: actionNone, handler: runnerB, group: "group1"},
-				},
-			},
-			wantAction:  actionNone,
-			wantHandler: runnerA,
-		},
-		{
-			name: "up_beats_none",
-			checkGroups: map[string][]checkResult{
-				"group1": {
-					{action: actionNone, handler: runnerA, group: "group1"},
-					{action: actionUp, handler: runnerB, group: "group1"},
-				},
-			},
-			wantAction:  actionUp,
-			wantHandler: runnerB,
-		},
-		{
-			name: "down_beats_none",
-			checkGroups: map[string][]checkResult{
-				"group1": {
-					{action: actionNone, handler: runnerA, group: "group1"},
-					{action: actionDown, handler: runnerB, group: "group1"},
-				},
-			},
-			wantAction:  actionDown,
-			wantHandler: runnerB,
-		},
-		{
-			name: "up_beats_down",
-			checkGroups: map[string][]checkResult{
-				"group1": {
-					{action: actionDown, handler: runnerA, group: "group1"},
-					{action: actionUp, handler: runnerB, group: "group1"},
-				},
-			},
-			wantAction:  actionUp,
-			wantHandler: runnerB,
-		},
-		{
-			name: "multiple_groups_up_wins",
-			checkGroups: map[string][]checkResult{
-				"group1": {
-					{action: actionNone, handler: runnerA, group: "group1"},
-				},
-				"group2": {
-					{action: actionUp, handler: runnerB, group: "group2"},
-					{action: actionDown, handler: runnerC, group: "group2"},
-				},
-			},
-			wantAction:  actionUp,
-			wantHandler: runnerB,
-		},
-		{
-			name:        "empty_input",
-			checkGroups: map[string][]checkResult{},
-			wantAction:  nil,
-			wantHandler: nil,
-		},
-		{
-			name: "nil_actions_ignored",
-			checkGroups: map[string][]checkResult{
-				"group1": {
-					{action: nil, handler: runnerA, group: "group1"},
-					{action: actionUp, handler: runnerB, group: "group1"},
-				},
-			},
-			wantAction:  actionUp,
-			wantHandler: runnerB,
-		},
-		{
-			name: "groupWinner_handler_is_nil",
-			checkGroups: map[string][]checkResult{
-				"group1": {
-					{action: actionUp, handler: nil, group: "group1"},   // handler is nil
-					{action: actionNone, handler: nil, group: "group1"}, // handler is nil
-				},
-				"group2": {
-					{action: actionUp, handler: runnerA, group: "group2"},
-				},
-			},
-			wantAction:  actionUp,
-			wantHandler: runnerA,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := pickWinnerActionFromGroups(tt.checkGroups)
-
-			if tt.wantAction == nil {
-				must.Nil(t, result.action)
-				must.Nil(t, result.handler)
-			} else {
-				must.NotNil(t, result.action)
-				must.Eq(t, tt.wantAction.Direction, result.action.Direction)
-				must.Eq(t, tt.wantAction.Count, result.action.Count)
-				must.NotNil(t, result.handler)
-			}
-		})
-	}
-}
-
 func TestHandler_calculateNewCount_SentinelErrorsSkipped_UnknownErrorFails(t *testing.T) {
 	testCases := []struct {
 		name            string
@@ -336,6 +202,24 @@ func TestHandler_calculateNewCount_SentinelErrorsSkipped_UnknownErrorFails(t *te
 			},
 			expectedCalls:  []int{1, 1},
 			expectedAction: sdk.ScalingAction{Direction: sdk.ScaleDirectionDown, Count: 0},
+		},
+		{
+			name: "sentinel_skipped_on_error_ignored",
+			runners: []*stubChecker{
+				{
+					checkName: "failing",
+					err:       errCheckIgnoredByOnError,
+				},
+				{
+					checkName: "healthy",
+					action:    sdk.ScalingAction{Direction: sdk.ScaleDirectionUp, Count: 8},
+				},
+			},
+			expectedCalls: []int{1, 1},
+			// The ignored check neither competes nor appears in the
+			// arbitration summary, so the winning action carries no
+			// arbitration Meta at all.
+			expectedAction: sdk.ScalingAction{Direction: sdk.ScaleDirectionUp, Count: 8},
 		},
 		{
 			name: "evaluation_canceled_aborts_loop",

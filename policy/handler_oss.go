@@ -34,6 +34,10 @@ func (nv *noopVerticalCheckRunner) group() string {
 	return ""
 }
 
+func (nv *noopVerticalCheckRunner) name() string {
+	return string(nv.policy.Type)
+}
+
 func (h *Handler) loadVerticalCheckRunner(policy *sdk.ScalingPolicy) (*noopVerticalCheckRunner, error) {
 	return &noopVerticalCheckRunner{
 		policy: policy,

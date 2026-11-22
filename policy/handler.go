@@ -64,6 +64,7 @@ type limiter interface {
 type checker interface {
 	runCheckAndCapCount(ctx context.Context, currentCount int64, cache *queryMetricsCache) (sdk.ScalingAction, error)
 	group() string
+	name() string
 }
 
 // Handler monitors a policy for changes and controls when them are sent for
@@ -493,35 +494,48 @@ func (h *Handler) calculateNewCount(ctx context.Context, currentCount int64) (sd
 		{Name: "target_name", Value: h.policy.Target.Name},
 	}
 
-	// Store check results by group so we can compare their results together.
-	checkGroups := make(map[string][]checkResult)
+	// Collect check results in policy.Checks declaration order. checkRunners
+	// is built from policy.Checks in loadCheckRunners, so the loop index is
+	// the declaration index used to break arbitration ties deterministically.
+	results := make([]checkResult, 0, len(h.checkRunners))
 	queryCache := newQueryMetricsCache()
 
-	for _, ch := range h.checkRunners {
+	for i, ch := range h.checkRunners {
 		action, err := ch.runCheckAndCapCount(ctx, currentCount, queryCache)
 		if err != nil {
 			if errors.Is(err, errCheckOutsideSchedule) {
 				h.log.Debug("skipping check, outside schedule window")
 				continue
 			}
+			if errors.Is(err, errCheckIgnoredByOnError) {
+				// The check failed but the failure is ignored by
+				// configuration: it neither competes in the arbitration nor
+				// appears in the arbitration summary. The failure itself was
+				// already logged as a warning by the check runner.
+				h.log.Debug("skipping check, error ignored by on_error configuration",
+					"check", ch.name())
+				continue
+			}
 			return sdk.ScalingAction{}, fmt.Errorf("failed to run check and cap count: %w", err)
 		}
 
-		g := ch.group()
-		checkGroups[g] = append(checkGroups[g], checkResult{
+		results = append(results, checkResult{
 			action:  &action,
 			handler: ch,
-			group:   g,
+			group:   ch.group(),
+			order:   i,
 		})
 	}
 
-	winner := pickWinnerActionFromGroups(checkGroups)
+	winner, participants := arbitrateCheckResults(results, arbitrationOptions{})
 	if winner.handler == nil || winner.action == nil {
 		return sdk.ScalingAction{}, nil
 	}
 
+	attachArbitrationMeta(winner.action, participants)
+
 	h.log.Debug("check selected", "direction", winner.action.Direction,
-		"count", winner.action.Count)
+		"count", winner.action.Count, "participants", len(participants))
 
 	// At this point the checks have finished. Therefore emit of metric data
 	// tracking how long it takes to run all the checks within a policy.
@@ -586,49 +600,14 @@ func calculateCooldown(p *sdk.ScalingPolicy, a sdk.ScalingAction) time.Duration 
 	return p.Cooldown
 }
 
-// pickWinnerActionFromGroups decide which action wins in the group.
-// The decision processes still picks the safest choice, but it handles `none`
-//
-//	actions a little differently.
-//
-// Since grouped checks have corelated metrics, it's expected that most
-// checks will result in `none` actions as the data will be somewhere
-// else. So we ignore none actions unless _all_ checks in the group
-// vote for `none` to avoid accidentally scaling down when comparing
-// with other groups.
-func pickWinnerActionFromGroups(checkGroups map[string][]checkResult) checkResult {
-	var winner checkResult
-	for group, results := range checkGroups {
-
-		var groupWinner checkResult
-
-		noneCount := 0
-		for _, r := range results {
-			if r.action == nil {
-				continue
-			}
-
-			if group != "" && r.action.Direction == sdk.ScaleDirectionNone {
-				noneCount += 1
-				continue
-			}
-			groupWinner = groupWinner.preempt(r)
-		}
-
-		// If all checks result in `none`, pick any one of them so when we
-		// don't scale down accidentally when comparing it with other groups.
-		if noneCount > 0 && noneCount == len(results) {
-			groupWinner = results[0]
-		}
-
-		if groupWinner.handler == nil {
-			continue
-		}
-
-		winner = winner.preempt(groupWinner)
-	}
-
-	return winner
+// checkResult is the outcome of a single check of a policy. The order field
+// holds the check's index in policy.Checks and is used to break arbitration
+// ties deterministically.
+type checkResult struct {
+	action  *sdk.ScalingAction
+	handler checker
+	group   string
+	order   int
 }
 
 func (h *Handler) getState() handlerState {
@@ -678,18 +657,4 @@ func (h *Handler) updateOutOfCooldownOn(ooc time.Time) {
 // no cooldown period is required.
 func calculateRemainingCooldown(cd time.Duration, ts, lastEvent int64) time.Duration {
 	return cd - time.Duration(ts-lastEvent)
-}
-
-type checkResult struct {
-	action  *sdk.ScalingAction
-	handler checker
-	group   string
-}
-
-func (c checkResult) preempt(other checkResult) checkResult {
-	winner := sdk.PreemptScalingAction(c.action, other.action)
-	if winner == c.action {
-		return c
-	}
-	return other
 }

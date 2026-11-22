@@ -27,6 +27,14 @@ var nowFunc = time.Now
 // evaluation.
 var errCheckOutsideSchedule = errors.New("check is not within defined schedule")
 
+// errCheckIgnoredByOnError signals that a check failed but the failure was
+// ignored per the check's on_error or the policy's on_check_error
+// configuration. The caller in the handler treats it as a non-fatal skip: the
+// failed check neither competes in the arbitration nor appears in the
+// arbitration summary. The failure itself is still logged as a warning where
+// it happens.
+var errCheckIgnoredByOnError = errors.New("check error ignored by on_error configuration")
+
 type CheckRunnerConfig struct {
 	// Log is the logger to use for logging.
 	Log hclog.Logger
@@ -116,7 +124,7 @@ func (ch *checkRunner) getNewCountFromStrategy(ctx context.Context, currentCount
 		// For unset or unrecognized values, fall back to policy on_check_error.
 		switch ch.check.OnError {
 		case sdk.ScalingPolicyOnErrorIgnore:
-			return sdk.ScalingAction{}, nil
+			return sdk.ScalingAction{}, errCheckIgnoredByOnError
 
 		case sdk.ScalingPolicyOnErrorFail:
 			return sdk.ScalingAction{}, err
@@ -128,7 +136,7 @@ func (ch *checkRunner) getNewCountFromStrategy(ctx context.Context, currentCount
 
 			// Non-fatal fallback path: skip this check result and continue evaluating
 			// the remaining checks in the policy.
-			return sdk.ScalingAction{}, nil
+			return sdk.ScalingAction{}, errCheckIgnoredByOnError
 		}
 	}
 
@@ -264,11 +272,17 @@ func (ch *checkRunner) group() string {
 	return ch.check.Group
 }
 
+func (ch *checkRunner) name() string {
+	return ch.check.Name
+}
+
 // runCheckAndCapCount evaluates the check and caps the returned action.
 //
 // The method returns errCheckOutsideSchedule when the check is outside its
-// schedule window; the caller should skip this check and continue. Any other
-// error, including context errors, should abort the evaluation.
+// schedule window, and errCheckIgnoredByOnError when the check failed but the
+// failure is ignored by configuration; the caller should skip this check and
+// continue in both cases. Any other error, including context errors, should
+// abort the evaluation.
 func (ch *checkRunner) runCheckAndCapCount(ctx context.Context, currentCount int64, cache *queryMetricsCache) (sdk.ScalingAction, error) {
 	ch.log.Debug("received policy check for evaluation")
 
